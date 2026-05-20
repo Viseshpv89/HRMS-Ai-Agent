@@ -1,0 +1,12 @@
+{
+  "comment": "Add these to your existing package.json dependencies",
+  "dependencies": {
+    "axios": "^1.7.0",
+    "node-cron": "^3.0.3",
+    "pg": "^8.11.0"
+  },
+  "scripts_to_add": {
+    "compliance:run": "node -e \"require('./compliance-agent').runCompliancePipeline().then(() => process.exit(0))\"",
+    "compliance:migrate": "psql $DB_URL -f compliance-db-schema.sql"
+  }
+}
