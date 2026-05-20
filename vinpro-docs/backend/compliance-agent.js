@@ -1,7 +1,13 @@
 /**
- * Vinpro HRMS — AI Labour Law Compliance Agent
+ * Vinpro HRMS — AI Payroll Compliance Agent
  * Backend service: Node.js / Express
- * 
+ *
+ * Monitors TWO regulatory domains:
+ *   1. Indian Labour Law  — PF, ESI, PT, Minimum Wages, Gratuity, Bonus, Maternity, LWF
+ *   2. Income Tax / TDS   — Section 192 (TDS on salary), standard deduction, regime slabs,
+ *                           Section 10 exemptions (HRA/LTA), Chapter VI-A (80C/80D/80G),
+ *                           perquisite valuation, Form 16 format, Finance Bill updates
+ *
  * ENV VARS REQUIRED:
  *   FIRECRAWL_API_KEY    — from firecrawl.dev
  *   GROQ_API_KEY         — from console.groq.com (free)
@@ -10,7 +16,7 @@
  *   ANTHROPIC_API_KEY    — (optional, for future upgrade)
  *   HRMS_INTERNAL_TOKEN  — your internal service token for HRMS API calls
  *   DB_URL               — your PostgreSQL connection string
- * 
+ *
  * ROUTES:
  *   POST /compliance/scrape-and-analyse   — trigger full pipeline manually
  *   GET  /compliance/changes              — list pending/all changes
@@ -99,17 +105,27 @@ async function callAnthropic(systemPrompt, userPrompt) {
 // ─── FIRECRAWL SCRAPER ─────────────────────────────────────────────────────────
 
 const SCRAPE_SOURCES = [
+  // ── Central labour law portals ───────────────────────────────────────────────
   { url: 'https://labour.gov.in/latest-news', label: 'Ministry of Labour - News', category: 'central' },
   { url: 'https://labour.gov.in/notifications', label: 'Ministry of Labour - Notifications', category: 'central' },
   { url: 'https://www.epfindia.gov.in/site_en/Circulars.php', label: 'EPFO Circulars', category: 'pf' },
   { url: 'https://www.esic.in/ESICWebUI/esicwebui.html#/circulars', label: 'ESIC Circulars', category: 'esi' },
-  { url: 'https://incometaxindia.gov.in/Pages/press-releases.aspx', label: 'Income Tax - Press Releases', category: 'tds' },
-  { url: 'https://incometaxindia.gov.in/Pages/notifications.aspx', label: 'Income Tax - Notifications', category: 'tds' },
+  { url: 'https://www.indiacode.nic.in/handle/123456789/1390', label: 'India Code - Labour Laws', category: 'central' },
+
+  // ── Income Tax / TDS portals (Section 192 + salary deductions) ───────────────
+  // Watches for: slab changes, standard deduction, regime updates, Form 16 format,
+  //              Section 10 exemptions (HRA/LTA), Chapter VI-A ceilings
+  { url: 'https://incometaxindia.gov.in/Pages/press-releases.aspx', label: 'IT Dept - Press Releases', category: 'it_press' },
+  { url: 'https://incometaxindia.gov.in/Pages/notifications.aspx', label: 'IT Dept - Notifications (Sec 192 / TDS)', category: 'it_notifications' },
+  { url: 'https://incometaxindia.gov.in/Pages/circulars.aspx', label: 'IT Dept - Circulars (employer TDS obligations)', category: 'it_circulars' },
+  { url: 'https://incometaxindia.gov.in/Pages/acts/income-tax-act.aspx', label: 'Income Tax Act - Sec 10/16/17/80C/80D/80G/192', category: 'it_act' },
+  { url: 'https://www.indiabudget.gov.in/', label: 'Union Budget / Finance Bill announcements', category: 'finance_bill' },
+
+  // ── State labour portals ─────────────────────────────────────────────────────
   { url: 'https://labour.tn.gov.in/', label: 'Tamil Nadu Labour Dept', category: 'state_tn' },
   { url: 'https://mahakamgar.maharashtra.gov.in/', label: 'Maharashtra Labour Dept', category: 'state_mh' },
   { url: 'https://labour.karnataka.gov.in/', label: 'Karnataka Labour Dept', category: 'state_ka' },
   { url: 'https://labour.delhi.gov.in/', label: 'Delhi Labour Dept', category: 'state_dl' },
-  { url: 'https://www.indiacode.nic.in/handle/123456789/1390', label: 'India Code - Labour Laws', category: 'central' },
 ];
 
 async function scrapeWithFirecrawl(url) {
@@ -182,8 +198,12 @@ async function fetchCurrentHRMSConfig() {
     });
     return res.data;
   } catch {
-    // Return known config structure if API unavailable
+    // Return known config structure if API unavailable.
+    // IMPORTANT: These are baseline values as originally configured.
+    // The agent will detect where the live law has moved ahead of these baselines
+    // and flag the delta as a compliance change requiring super-admin approval.
     return {
+      // ── Statutory deductions ─────────────────────────────────────────────────
       pf_employee_rate: 12,
       pf_employer_rate: 12,
       pf_wage_ceiling: 15000,
@@ -194,39 +214,123 @@ async function fetchCurrentHRMSConfig() {
       minimum_wages: { TN: 8660, MH: 12655, KA: 10870, DL: 17494 },
       gratuity_formula: '15/26',
       gratuity_eligibility_years: 5,
-      tds_sections: ['192', '194C', '194J'],
-      new_tax_regime_default: false,
       bonus_act_ceiling: 21000,
       maternity_benefit_weeks: 26,
+
+      // ── Income Tax / TDS config (Section 192 — TDS on salary) ────────────────
+      // Standard deduction under Section 16(ia)
+      // NOTE: Finance Act 2024 raised this to ₹75,000 for new regime.
+      //       Old regime remains ₹50,000. Agent will flag this if not updated.
+      tds_standard_deduction: 50000,
+
+      // Default regime selection for new employees
+      tds_regime_default: 'new',
+
+      // Old Regime slabs (unchanged since FY 2023-24)
+      tds_old_regime_slabs: [
+        { from: 0,       to: 250000,  rate: 0  },
+        { from: 250001,  to: 500000,  rate: 5  },
+        { from: 500001,  to: 1000000, rate: 20 },
+        { from: 1000001, to: null,    rate: 30 },
+      ],
+
+      // New Regime slabs as originally configured (FY 2023-24 baseline).
+      // Budget 2025 changed these significantly — agent should detect and flag
+      // if the live IT portal announces updated slabs.
+      tds_new_regime_slabs: [
+        { from: 0,       to: 300000,  rate: 0  },
+        { from: 300001,  to: 600000,  rate: 5  },
+        { from: 600001,  to: 900000,  rate: 10 },
+        { from: 900001,  to: 1200000, rate: 15 },
+        { from: 1200001, to: 1500000, rate: 20 },
+        { from: 1500001, to: null,    rate: 30 },
+      ],
+
+      // Chapter VI-A deduction ceilings
+      tds_section_80c_ceiling: 150000,
+      tds_section_80d_self: 25000,
+      tds_section_80d_senior_parent: 50000,
+
+      // Section 10 exemption parameters
+      tds_hra_metro_pct: 50,          // HRA exemption % for metro cities
+      tds_hra_nonmetro_pct: 40,       // HRA exemption % for non-metro
+      tds_lta_exemption_enabled: true,
+
+      // 87A rebate limit for new regime (₹7L baseline; Budget 2025 raised to ₹12L)
+      tds_new_regime_rebate_ceiling: 700000,
+
+      // Surcharge threshold (₹50L — where 10% surcharge kicks in)
+      tds_surcharge_threshold: 5000000,
     };
   }
 }
 
 // ─── AI ANALYSIS ENGINE ───────────────────────────────────────────────────────
 
-const SYSTEM_PROMPT = `You are an expert Indian labour law and payroll compliance analyst.
+const SYSTEM_PROMPT = `You are an expert Indian payroll and tax compliance analyst covering both labour law and income tax law as they affect employer salary computations.
+
 Your job is to:
-1. Analyse scraped content from official government portals about labour law updates
-2. Compare these updates against the current HRMS/payroll configuration
+1. Analyse scraped content from official government portals (labour law AND Income Tax Department) about regulatory updates
+2. Compare these updates against the current HRMS payroll configuration
 3. Identify specific changes that need to be made to the payroll system to stay compliant
 4. Output ONLY a valid JSON array of compliance change objects — nothing else
 
 Each change object must have:
 {
-  "change_type": "rate_change" | "ceiling_change" | "new_requirement" | "deadline_change" | "exemption_change" | "form_change",
-  "affected_module": "pf" | "esi" | "tds" | "professional_tax" | "minimum_wage" | "gratuity" | "bonus" | "maternity" | "labour_welfare_fund" | "payroll_settings",
-  "law_reference": "exact act/notification/circular reference",
+  "change_type": "rate_change" | "ceiling_change" | "new_requirement" | "deadline_change" | "exemption_change" | "form_change" | "slab_change" | "regime_change",
+  "affected_module": one of the values listed below,
+  "law_reference": "exact act/notification/circular reference (e.g. 'Finance Act 2025 s.2(3)', 'CBDT Circular No.04/2025', 'EPFO Circular WSU/40/15/1/2024')",
   "state_applicable": "ALL" | "TN" | "MH" | "KA" | "DL" | etc,
   "effective_date": "YYYY-MM-DD or null",
-  "summary": "1-2 sentence plain English explanation of the change",
+  "summary": "1-2 sentence plain English explanation of the change and its payroll impact",
   "old_value": { ... current config values that need changing ... },
   "new_value": { ... what they should change to ... },
   "impact_severity": "critical" | "high" | "medium" | "low",
   "confidence": 0.0-1.0
 }
 
+AFFECTED MODULE VALUES — Labour Law:
+  "pf"                  — PF/EPF rate or wage ceiling changes (EPFO)
+  "esi"                 — ESI rate or wage ceiling changes (ESIC)
+  "professional_tax"    — PT rate or slab changes (state-specific)
+  "minimum_wage"        — Minimum wage revision (state-specific)
+  "gratuity"            — Gratuity formula, eligibility or ceiling changes
+  "bonus"               — Bonus Act ceiling or eligibility changes
+  "maternity"           — Maternity Benefit Act changes
+  "labour_welfare_fund" — LWF rate or applicability changes
+  "payroll_settings"    — General payroll config changes not covered above
+
+AFFECTED MODULE VALUES — Income Tax / TDS (Section 192):
+  "tds_slab"              — Income tax slab rate changes (either regime)
+  "tds_standard_deduction"— Standard deduction limit under Section 16(ia)
+  "tds_section_10"        — Section 10 exemptions: HRA (10(13A)), LTA (10(5)), children education allowance (10(14))
+  "tds_section_80c"       — 80C deduction ceiling: PF, PPF, LIC, ELSS, tuition fees, home loan principal
+  "tds_section_80d"       — 80D: medical insurance premium deduction ceiling
+  "tds_section_80g"       — 80G: donations and charitable contribution deductions
+  "tds_perquisites"       — Perquisite valuation rule changes: company car, ESOP, rent-free accommodation
+  "tds_form16"            — Structural changes to Form 16 Part A or Part B format
+  "tds_new_regime"        — New tax regime slab changes, rebate ceiling, standard deduction (Budget announcements)
+  "tds_old_regime"        — Old tax regime specific changes (slab rates, exemptions)
+  "tds_declaration_window"— IT declaration / proof of investment submission window dates
+
+INCOME TAX ANALYSIS GUIDANCE:
+- Pay special attention to Finance Bill / Finance Act announcements — these change slab rates every year
+- Standard deduction changes affect ALL salaried employees — always mark as impact_severity: "high" or "critical"
+- Regime slab changes affect how TDS is computed for new vs old regime employees
+- Section 80C ceiling changes affect the maximum deduction employees can claim
+- 87A rebate ceiling changes affect whether employees pay zero tax (current new regime: ₹12L rebate ceiling as of Budget 2025)
+- HRA exemption formula (min of 3 rules) is unchanged but metro city classification may change
+- New regime made default from FY 2024-25 onwards — flag if any circular changes this
+
+SEVERITY GUIDELINES:
+  critical — affects TDS computation formula or rate directly (slab changes, standard deduction, rebate ceiling)
+  high     — affects deduction ceilings or exemption rules (80C, 80D, HRA%)
+  medium   — affects form formats, declaration windows, clarifications
+  low      — interpretive circulars, FAQ-type notifications with no config impact
+
 Only output changes where confidence >= 0.6. If nothing changed, return [].
-Do NOT invent changes. Only report what the scraped content explicitly mentions.`;
+Do NOT invent changes. Only report what the scraped content EXPLICITLY mentions.
+For income tax content: only flag changes from FY 2024-25 onwards (earlier FY changes are already known).`;
 
 async function analyseContent(rawContent, currentConfig, rawUpdateId) {
   const userPrompt = `
@@ -431,16 +535,44 @@ async function applyChangeToHRMS(change) {
     : change.new_value;
 
   const moduleEndpointMap = {
-    pf: '/api/employer/payroll/settings/pf',
-    esi: '/api/employer/payroll/settings/esi',
-    tds: '/api/employer/payroll/settings/tds',
-    professional_tax: '/api/employer/payroll/settings/professional-tax',
-    minimum_wage: '/api/employer/payroll/settings/minimum-wages',
-    gratuity: '/api/employer/payroll/settings/gratuity',
-    bonus: '/api/employer/payroll/settings/bonus',
-    maternity: '/api/employer/payroll/settings/statutory',
-    labour_welfare_fund: '/api/employer/payroll/settings/lwf',
-    payroll_settings: '/api/employer/payroll/settings',
+    // ── Labour law modules ────────────────────────────────────────────────────
+    pf:                    '/api/employer/payroll/settings/pf',
+    esi:                   '/api/employer/payroll/settings/esi',
+    professional_tax:      '/api/employer/payroll/settings/professional-tax',
+    minimum_wage:          '/api/employer/payroll/settings/minimum-wages',
+    gratuity:              '/api/employer/payroll/settings/gratuity',
+    bonus:                 '/api/employer/payroll/settings/bonus',
+    maternity:             '/api/employer/payroll/settings/statutory',
+    labour_welfare_fund:   '/api/employer/payroll/settings/lwf',
+    payroll_settings:      '/api/employer/payroll/settings',
+
+    // ── Income Tax / TDS modules (Section 192) ────────────────────────────────
+    // Slab changes affect both regime computation paths — high impact
+    tds_slab:              '/api/employer/payroll/settings/tds/slabs',
+
+    // Standard deduction under Section 16(ia) — applies to all employees
+    tds_standard_deduction: '/api/employer/payroll/settings/tds',
+
+    // Section 10 exemptions: HRA, LTA, children education allowance
+    tds_section_10:        '/api/employer/payroll/settings/tds/exemptions',
+
+    // Chapter VI-A deduction ceilings
+    tds_section_80c:       '/api/employer/payroll/settings/tds/deductions',
+    tds_section_80d:       '/api/employer/payroll/settings/tds/deductions',
+    tds_section_80g:       '/api/employer/payroll/settings/tds/deductions',
+
+    // Perquisite valuation rules (company car, ESOP, rent-free accommodation)
+    tds_perquisites:       '/api/employer/payroll/settings/tds/perquisites',
+
+    // Form 16 format changes — flagged but require manual template update
+    tds_form16:            '/api/employer/payroll/settings/tds',
+
+    // New / old regime specific updates
+    tds_new_regime:        '/api/employer/payroll/settings/tds/new-regime',
+    tds_old_regime:        '/api/employer/payroll/settings/tds/old-regime',
+
+    // Declaration window dates (when employees can submit IT declarations)
+    tds_declaration_window: '/api/employer/payroll/settings/tds/windows',
   };
 
   const endpoint = moduleEndpointMap[change.affected_module] || '/api/employer/payroll/settings';
