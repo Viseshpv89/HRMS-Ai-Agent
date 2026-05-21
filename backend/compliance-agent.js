@@ -1,12 +1,12 @@
 /**
  * Vinpro HRMS — AI Labour Law Compliance Agent
  * Backend service: Node.js / Express
- * 
+ *
  * ENV VARS REQUIRED:
  *   FIRECRAWL_API_KEY    — from firecrawl.dev
  *   GROQ_API_KEY         — from console.groq.com (free)
- *   LLM_PROVIDER         — "groq" | "gemini" | "openai" | "anthropic" (default: "groq")
- *   GEMINI_API_KEY       — from aistudio.google.com (free tier available)
+ *   GEMINI_API_KEY       — from aistudio.google.com (free, required for default provider)
+ *   LLM_PROVIDER         — "gemini" | "groq" | "openai" | "anthropic" (default: "gemini")
  *   OPENAI_API_KEY       — (optional, for future upgrade)
  *   ANTHROPIC_API_KEY    — (optional, for future upgrade)
  *   HRMS_INTERNAL_TOKEN  — your internal service token for HRMS API calls
@@ -31,14 +31,27 @@ const pool = new Pool({ connectionString: process.env.DB_URL });
 const HRMS_BASE = 'https://hrms.vinproconnect.com';
 
 // ─── LLM PROVIDER ABSTRACTION ─────────────────────────────────────────────────
+// Default: Gemini 2.5 Pro (best for reading legal/regulatory text, free tier)
+// Auto-fallback: if primary fails, silently switches to the other free provider
+// Plan B scraping: callGeminiWithGrounding() replaces Firecrawl when it fails
 
 async function callLLM(systemPrompt, userPrompt) {
-  const provider = process.env.LLM_PROVIDER || 'groq';
+  const provider = process.env.LLM_PROVIDER || 'gemini';
 
-  if (provider === 'groq') {
-    return callGroq(systemPrompt, userPrompt);
-  } else if (provider === 'gemini') {
-    return callGemini(systemPrompt, userPrompt);
+  if (provider === 'gemini') {
+    try {
+      return await callGeminiPro(systemPrompt, userPrompt);
+    } catch (err) {
+      console.warn('[LLM] Gemini Pro failed, auto-fallback to Groq:', err.message);
+      return callGroq(systemPrompt, userPrompt);
+    }
+  } else if (provider === 'groq') {
+    try {
+      return await callGroq(systemPrompt, userPrompt);
+    } catch (err) {
+      console.warn('[LLM] Groq failed, auto-fallback to Gemini Pro:', err.message);
+      return callGeminiPro(systemPrompt, userPrompt);
+    }
   } else if (provider === 'openai') {
     return callOpenAI(systemPrompt, userPrompt);
   } else if (provider === 'anthropic') {
@@ -47,6 +60,38 @@ async function callLLM(systemPrompt, userPrompt) {
   throw new Error(`Unknown LLM_PROVIDER: ${provider}`);
 }
 
+// Plan A primary: Gemini 2.5 Pro — best at parsing dense legal/regulatory text
+// Free via Google AI Studio: https://aistudio.google.com/apikey
+async function callGeminiPro(systemPrompt, userPrompt) {
+  const res = await axios.post(
+    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent?key=${process.env.GEMINI_API_KEY}`,
+    {
+      contents: [{ role: 'user', parts: [{ text: userPrompt }] }],
+      systemInstruction: { parts: [{ text: systemPrompt }] },
+      generationConfig: { temperature: 0.1, maxOutputTokens: 8192 },
+    },
+    { headers: { 'Content-Type': 'application/json' } }
+  );
+  return res.data.candidates[0].content.parts[0].text;
+}
+
+// Plan B scraping: when Firecrawl fails, use Gemini 2.5 Pro + Google Search grounding
+// This lets Gemini directly search and fetch up-to-date regulatory content
+async function callGeminiWithGrounding(systemPrompt, userPrompt) {
+  const res = await axios.post(
+    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent?key=${process.env.GEMINI_API_KEY}`,
+    {
+      contents: [{ role: 'user', parts: [{ text: userPrompt }] }],
+      systemInstruction: { parts: [{ text: systemPrompt }] },
+      tools: [{ googleSearch: {} }],  // enables live Google Search grounding
+      generationConfig: { temperature: 0.1, maxOutputTokens: 8192 },
+    },
+    { headers: { 'Content-Type': 'application/json' } }
+  );
+  return res.data.candidates[0].content.parts[0].text;
+}
+
+// Fallback: Groq Llama 3.3 70B — fast, free, good enough for compliance summaries
 async function callGroq(systemPrompt, userPrompt) {
   const res = await axios.post(
     'https://api.groq.com/openai/v1/chat/completions',
@@ -64,11 +109,8 @@ async function callGroq(systemPrompt, userPrompt) {
   return res.data.choices[0].message.content;
 }
 
-
+// Legacy Gemini Flash — kept for reference / manual override
 async function callGemini(systemPrompt, userPrompt) {
-  // Gemini 2.5 Flash — FREE via Google AI Studio (generous free tier)
-  // Get your free API key: https://aistudio.google.com/apikey
-  // Recommended for compliance: better at reading legal/regulatory text than Llama
   const res = await axios.post(
     `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
     {
@@ -188,7 +230,7 @@ async function saveComplianceChange(change) {
     JSON.stringify(change.old_value),
     JSON.stringify(change.new_value),
     change.impact_severity,
-    process.env.LLM_PROVIDER || 'groq',
+    process.env.LLM_PROVIDER || 'gemini',
   ]);
   return res.rows[0].id;
 }
@@ -293,19 +335,40 @@ async function runCompliancePipeline() {
 
   for (const source of SCRAPE_SOURCES) {
     console.log(`[Scraping] ${source.label}`);
-    const content = await scrapeWithFirecrawl(source.url);
-    
+    let content = await scrapeWithFirecrawl(source.url);
+    let usedGrounding = false;
+
     if (!content || content.length < 100) {
-      console.log(`[Scraping] Skipping — no content for ${source.url}`);
+      // Plan B: Firecrawl failed/empty — use Gemini + Google Search grounding instead
+      console.log(`[Scraping] Firecrawl returned no content for ${source.label} — switching to Gemini grounding`);
+      try {
+        const groundingPrompt = `Search for the latest compliance updates, circulars, and notifications from this official Indian government source: ${source.url} (${source.label}). Focus on labour law, payroll, PF, ESI, TDS, minimum wages, and statutory changes. Summarise all recent updates you find.`;
+        content = await callGeminiWithGrounding(
+          'You are a compliance research assistant. Search for and summarise recent regulatory updates from Indian government portals.',
+          groundingPrompt
+        );
+        usedGrounding = true;
+        console.log(`[Scraping] Gemini grounding returned ${content.length} chars for ${source.label}`);
+      } catch (err) {
+        console.warn(`[Scraping] Gemini grounding also failed for ${source.label}:`, err.message);
+      }
+    }
+
+    if (!content || content.length < 100) {
+      console.log(`[Scraping] Skipping — both Firecrawl and grounding returned no content for ${source.url}`);
       continue;
     }
 
-    const rawId = await saveRawUpdate(source, content, source.category);
-    console.log(`[Analysis] Analysing ${source.label} with ${process.env.LLM_PROVIDER || 'groq'}...`);
-    
+    const rawId = await saveRawUpdate(
+      { ...source, label: usedGrounding ? `${source.label} (via Gemini grounding)` : source.label },
+      content,
+      source.category
+    );
+    console.log(`[Analysis] Analysing ${source.label} with ${process.env.LLM_PROVIDER || 'gemini'}...`);
+
     const changes = await analyseContent(content, currentConfig, rawId);
     allChanges.push(...changes);
-    
+
     // Rate limit: wait 2s between sources
     await new Promise(r => setTimeout(r, 2000));
   }
@@ -424,7 +487,7 @@ router.get('/raw-updates', requireSuperAdmin, async (req, res) => {
 // Get/set LLM provider
 router.get('/provider', requireSuperAdmin, (req, res) => {
   res.json({ 
-    current: process.env.LLM_PROVIDER || 'groq',
+    current: process.env.LLM_PROVIDER || 'gemini',
     available: ['groq', 'gemini', 'openai', 'anthropic'],
     descriptions: {
       groq:      'Groq Llama 3.3 70B (free — fast)',
